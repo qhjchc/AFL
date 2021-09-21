@@ -138,6 +138,8 @@ EXP_ST u8  skip_deterministic,        /* Skip deterministic stages?       */
            deferred_mode,             /* Deferred forkserver mode?        */
            fast_cal;                  /* Try to calibrate faster?         */
 
+EXP_ST u8 logging;
+
 static s32 out_fd,                    /* Persistent fd for out_file       */
            dev_urandom_fd = -1,       /* Persistent fd for /dev/urandom   */
            dev_null_fd = -1,          /* Persistent fd for /dev/null      */
@@ -179,6 +181,10 @@ EXP_ST u32 queued_paths,              /* Total number of queued testcases */
            current_entry,             /* Current queue entry ID           */
            havoc_div = 1;             /* Cycle count divisor for havoc    */
 
+EXP_ST u64 total_fuzz,
+           total_selected,
+           total_energy_used;
+
 EXP_ST u64 total_crashes,             /* Total number of crashes          */
            unique_crashes,            /* Crashes with unique signatures   */
            total_tmouts,              /* Total number of timeouts         */
@@ -205,7 +211,7 @@ static u8 *stage_name = "init",       /* Name of the current fuzz stage   */
           *stage_short,               /* Short stage name                 */
           *syncing_party;             /* Currently syncing with...        */
 
-static s32 stage_cur, stage_max;      /* Stage progression                */
+static s32 stage_cur, stage_max, stage_last, stage_overall;      /* Stage progression                */
 static s32 splicing_with = -1;        /* Splicing with which test case?   */
 
 static u32 master_id, master_max;     /* Master instance job splitting    */
@@ -237,6 +243,7 @@ static s32 cpu_aff = -1;       	      /* Selected CPU core                */
 #endif /* HAVE_AFFINITY */
 
 static FILE* plot_file;               /* Gnuplot output file              */
+static FILE* profile_file;
 
 struct queue_entry {
 
@@ -254,9 +261,16 @@ struct queue_entry {
 
   u32 bitmap_size,                    /* Number of bits set in bitmap     */
       exec_cksum;                     /* Checksum of the execution trace  */
+      u32 p_len;
+      u32 pn_len;
+      u32 new_find;
+      u32 last_find;
 
   u64 exec_us,                        /* Execution time (us)              */
-      handicap,                       /* Number of queue cycles behind    */
+      handicap,                       /* Number of queue cycles behind    */    num_selected,
+      num_mutated,
+      num_executed,
+      energy_used,
       depth;                          /* Path depth                       */
 
   u8* trace_mini;                     /* Trace bytes, if kept             */
@@ -809,6 +823,18 @@ static void add_to_queue(u8* fname, u32 len, u8 passed_det) {
   q->len          = len;
   q->depth        = cur_depth + 1;
   q->passed_det   = passed_det;
+
+  q->num_selected = 0;
+  q->trace_mini = 0;
+  q->new_find = 0;
+  q->num_mutated = 0;
+  q->num_executed = 0;
+  q->was_fuzzed = 0;
+  q->energy_used = 0;
+  q->last_find = 0;
+
+  q->p_len = 0;
+  q->pn_len = 0;
 
   if (q->depth > max_depth) max_depth = q->depth;
 
@@ -1373,6 +1399,13 @@ EXP_ST void setup_shm(void) {
   u8* shm_str;
 
   if (!in_bitmap) memset(virgin_bits, 255, MAP_SIZE);
+  
+  total_fuzz = 0;
+  total_selected = 0;
+  total_energy_used = 1;
+  stage_last = 0;
+  stage_overall = 0;
+  queued_discovered = 0;
 
   memset(virgin_tmout, 255, MAP_SIZE);
   memset(virgin_crash, 255, MAP_SIZE);
@@ -3167,6 +3200,11 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
   s32 fd;
   u8  keeping = 0, res;
 
+  u32 checksum = hash32(trace_bits, MAP_SIZE, HASH_CONST);
+  if (checksum == queue_cur->exec_cksum) {
+      queue_cur->num_executed++;
+  }
+
   if (fault == crash_mode) {
 
     /* Keep only if there are new bits in the map, add to queue for
@@ -3189,6 +3227,8 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
 #endif /* ^!SIMPLE_FILES */
 
     add_to_queue(fn, len, 0);
+    queue_cur->new_find++;
+    queue_cur->last_find = 1;
 
     if (hnb == 2) {
       queue_top->has_new_cov = 1;
@@ -3542,11 +3582,12 @@ static void maybe_update_plot_file(double bitmap_cvg, double eps) {
      favored_not_fuzzed, unique_crashes, unique_hangs, max_depth,
      execs_per_sec */
 
-  fprintf(plot_file, 
-          "%llu, %llu, %u, %u, %u, %u, %0.02f%%, %llu, %llu, %u, %0.02f\n",
+  fprintf(plot_file,
+          "%llu, %llu, %u, %u, %u, %u, %0.02f%%, %llu, %llu, %u, %0.02f, %lld, %lld, %lld\n",
           get_cur_time() / 1000, queue_cycle - 1, current_entry, queued_paths,
           pending_not_fuzzed, pending_favored, bitmap_cvg, unique_crashes,
-          unique_hangs, max_depth, eps); /* ignore errors */
+          unique_hangs, max_depth, eps,
+          total_fuzz, total_selected, total_energy_used); /* ignore errors */
 
   fflush(plot_file);
 
@@ -4661,6 +4702,7 @@ EXP_ST u8 common_fuzz_stuff(char** argv, u8* out_buf, u32 len) {
   write_to_testcase(out_buf, len);
 
   fault = run_target(argv, exec_tmout);
+  total_fuzz++;
 
   if (stop_soon) return 1;
 
@@ -4686,7 +4728,18 @@ EXP_ST u8 common_fuzz_stuff(char** argv, u8* out_buf, u32 len) {
 
   /* This handles FAULT_ERROR for us: */
 
-  queued_discovered += save_if_interesting(argv, out_buf, len, fault);
+  // queued_discovered += save_if_interesting(argv, out_buf, len, fault);
+
+  u8 found;
+  found = save_if_interesting(argv, out_buf, len, fault);
+
+  if (found) {
+      queue_cur->energy_used += stage_overall - stage_last;
+      total_energy_used += stage_overall - stage_last;
+      stage_last = stage_overall;
+  }
+
+  queued_discovered += found;
 
   if (!(stage_cur % stats_update_freq) || stage_cur + 1 == stage_max)
     show_stats();
@@ -5181,6 +5234,7 @@ static u8 fuzz_one(char** argv) {
 
   for (stage_cur = 0; stage_cur < stage_max; stage_cur++) {
 
+    stage_overall++;
     stage_cur_byte = stage_cur >> 3;
 
     FLIP_BIT(out_buf, stage_cur);
@@ -6156,6 +6210,7 @@ havoc_stage:
 
   for (stage_cur = 0; stage_cur < stage_max; stage_cur++) {
 
+    stage_overall++;
     u32 use_stacking = 1 << (1 + UR(HAVOC_STACK_POW2));
 
     stage_cur_val = use_stacking;
@@ -6557,6 +6612,8 @@ havoc_stage:
       havoc_queued = queued_paths;
 
     }
+
+    queue_cur->num_mutated++;
 
   }
 
@@ -7266,7 +7323,8 @@ EXP_ST void setup_dirs_fds(void) {
 
   fprintf(plot_file, "# unix_time, cycles_done, cur_path, paths_total, "
                      "pending_total, pending_favs, map_size, unique_crashes, "
-                     "unique_hangs, max_depth, execs_per_sec\n");
+                     "unique_hangs, max_depth, execs_per_sec, "
+                     "total_fuzz, total_select, total_energy_used\n");
                      /* ignore errors */
 
 }
@@ -7777,10 +7835,11 @@ static void save_cmdline(u32 argc, char** argv) {
 
 int main(int argc, char** argv) {
 
-  s32 opt;
+  s32 opt, fd;
   u64 prev_queued = 0;
   u32 sync_interval_cnt = 0, seek_to;
-  u8  *extras_dir = 0;
+  u8  *extras_dir = 0,
+      *tmp;
   u8  mem_limit_given = 0;
   u8  exit_1 = !!getenv("AFL_BENCH_JUST_ONE");
   char** use_argv;
@@ -7795,7 +7854,7 @@ int main(int argc, char** argv) {
   gettimeofday(&tv, &tz);
   srandom(tv.tv_sec ^ tv.tv_usec ^ getpid());
 
-  while ((opt = getopt(argc, argv, "+i:o:f:m:b:t:T:dnCB:S:M:x:QV")) > 0)
+  while ((opt = getopt(argc, argv, "+i:o:f:m:b:t:T:dnCB:S:M:x:QV:Ql")) > 0)
 
     switch (opt) {
 
@@ -7979,6 +8038,11 @@ int main(int argc, char** argv) {
 
         /* Version number has been printed already, just quit. */
         exit(0);
+      
+      case 'l': /* log */
+
+        logging = 1;
+        break;
 
       default:
 
@@ -8130,7 +8194,9 @@ int main(int argc, char** argv) {
 
     }
 
+    queue_cur->num_selected++;
     skipped_fuzz = fuzz_one(use_argv);
+    total_selected++;
 
     if (!stop_soon && sync_id && !skipped_fuzz) {
       
@@ -8145,6 +8211,28 @@ int main(int argc, char** argv) {
 
     queue_cur = queue_cur->next;
     current_entry++;
+
+    if (logging) {
+
+      tmp = alloc_printf("%s/length_profile", out_dir);
+      fd = open(tmp, O_WRONLY | O_CREAT, 0600);
+      profile_file = fdopen(fd, "w");
+      if (!plot_file) PFATAL("fdopen() failed");
+
+      struct queue_entry *it = queue;
+      fprintf(profile_file,
+              "p_len,  pn_len,     num_mutate,   find, selected, en_assigned, has_newcov, favor, num_executed\n");
+      while (it) {
+          fprintf(profile_file, "%6d, %6d, %10lld, %6d, %5lld, %10lld, %9d, %8d, %12lld\n",
+                  it->p_len, it->pn_len,
+                  it->num_mutated, it->new_find, it->num_selected, it->energy_used, it->has_new_cov, it->favored, it->num_executed);
+          it = it->next;
+      }
+
+      fprintf(profile_file, "\n");
+      fclose(profile_file);
+      ck_free(tmp);
+    }
 
   }
 
