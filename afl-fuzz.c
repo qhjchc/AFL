@@ -165,6 +165,7 @@ static volatile u8 stop_soon,         /* Ctrl-C pressed?                  */
                    child_timed_out;   /* Traced process timed out?        */
 
 EXP_ST u32 queued_paths,              /* Total number of queued testcases */
+           tmp_queue,
            queued_variable,           /* Testcases with variable behavior */
            queued_at_start,           /* Total number of initial inputs   */
            queued_discovered,         /* Items discovered during this run */
@@ -265,6 +266,7 @@ struct queue_entry {
       u32 pn_len;
       u32 new_find;
       u32 last_find;
+      u32 no_find;
 
   u64 exec_us,                        /* Execution time (us)              */
       handicap,                       /* Number of queue cycles behind    */    num_selected,
@@ -831,6 +833,8 @@ static void add_to_queue(u8* fname, u32 len, u8 passed_det) {
   q->num_executed = 0;
   q->was_fuzzed = 0;
   q->energy_used = 0;
+
+  q->no_find = 0;
   q->last_find = 0;
 
   q->p_len = 0;
@@ -1401,6 +1405,7 @@ EXP_ST void setup_shm(void) {
   if (!in_bitmap) memset(virgin_bits, 255, MAP_SIZE);
   
   total_fuzz = 0;
+  tmp_queue = 0;
   total_selected = 0;
   total_energy_used = 1;
   stage_last = 0;
@@ -6717,6 +6722,11 @@ retry_splicing:
 
   }
 
+  if(tmp_queue == queued_paths) {
+    queue_cur->no_find++;
+    tmp_queue = queued_paths;
+  }
+
 #endif /* !IGNORE_FINDS */
 
   ret_val = 0;
@@ -8196,6 +8206,7 @@ int main(int argc, char** argv) {
 
     queue_cur->num_selected++;
     skipped_fuzz = fuzz_one(use_argv);
+
     total_selected++;
 
     if (!stop_soon && sync_id && !skipped_fuzz) {
@@ -8221,11 +8232,11 @@ int main(int argc, char** argv) {
 
       struct queue_entry *it = queue;
       fprintf(profile_file,
-              "p_len,  pn_len,     num_mutate,   find, selected, en_assigned, has_newcov, favor, num_executed\n");
+              "p_len,  pn_len,     num_mutate,   find, selected, en_assigned, has_newcov, favor, num_executed, no_find\n");
       while (it) {
-          fprintf(profile_file, "%6d, %6d, %10lld, %6d, %5lld, %10lld, %9d, %8d, %12lld\n",
+          fprintf(profile_file, "%6d, %6d, %10lld, %6d, %5lld, %10lld, %9d, %8d, %12lld, %d\n",
                   it->p_len, it->pn_len,
-                  it->num_mutated, it->new_find, it->num_selected, it->energy_used, it->has_new_cov, it->favored, it->num_executed);
+                  it->num_mutated, it->new_find, it->num_selected, it->energy_used, it->has_new_cov, it->favored, it->num_executed, it->no_find);
           it = it->next;
       }
 
