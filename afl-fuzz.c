@@ -6722,10 +6722,6 @@ retry_splicing:
 
   }
 
-  if(tmp_queue == queued_paths) {
-    queue_cur->no_find++;
-    tmp_queue = queued_paths;
-  }
 
 #endif /* !IGNORE_FINDS */
 
@@ -8205,7 +8201,12 @@ int main(int argc, char** argv) {
     }
 
     queue_cur->num_selected++;
+    tmp_queue = queue_cur->new_find;
     skipped_fuzz = fuzz_one(use_argv);
+
+    if(tmp_queue == queue_cur->new_find) {
+      queue_cur->no_find++;
+    }
 
     total_selected++;
 
